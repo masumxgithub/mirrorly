@@ -41,8 +41,13 @@ $rel = Join-Path $root "target\release"
 Copy-Item "$rel\Mirrorly.exe" $stage
 # Only the FFmpeg libraries Mirrorly loads (checked with llvm-readobj --coff-imports).
 foreach ($lib in 'avcodec', 'avutil', 'swresample') {
-    $dll = Get-ChildItem "$rel\$lib-*.dll" | Select-Object -First 1
-    if (-not $dll) { throw "$lib DLL missing in target\release" }
+    # FFmpeg's shared build keeps runtime DLLs in third_party\ffmpeg\bin;
+    # copy from there (or target\release if Cargo has already staged them).
+    $dll = Get-ChildItem "$rel\$lib-*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $dll) {
+        $dll = Get-ChildItem "$root\third_party\ffmpeg\bin\$lib-*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $dll) { throw "$lib DLL missing in target\release and third_party\ffmpeg\bin" }
     Copy-Item $dll.FullName $stage
 }
 Copy-Item LICENSE "$stage\LICENSE.txt"
