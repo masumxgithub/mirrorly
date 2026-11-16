@@ -26,7 +26,25 @@ pub fn hid_usage(code: K) -> Option<u16> {
         return Some(0x1E + i as u16);
     }
     Some(match code {
-        K::Enter | K::NumpadEnter => 0x28,
+        K::Enter => 0x28,
+        K::NumpadEnter => 0x58,
+        K::Numpad0 => 0x62,
+        K::Numpad1 => 0x59,
+        K::Numpad2 => 0x5A,
+        K::Numpad3 => 0x5B,
+        K::Numpad4 => 0x5C,
+        K::Numpad5 => 0x5D,
+        K::Numpad6 => 0x5E,
+        K::Numpad7 => 0x5F,
+        K::Numpad8 => 0x60,
+        K::Numpad9 => 0x61,
+        K::NumpadDecimal => 0x63,
+        K::NumpadDivide => 0x54,
+        K::NumpadMultiply => 0x55,
+        K::NumpadSubtract => 0x56,
+        K::NumpadAdd => 0x57,
+        K::NumpadEqual => 0x67,
+        K::NumpadComma => 0x85,
         K::Escape => 0x29,
         K::Backspace => 0x2A,
         K::Tab => 0x2B,
@@ -73,6 +91,16 @@ mod tests {
         assert_eq!(hid_usage(K::Digit1), Some(0x1E));
         assert_eq!(hid_usage(K::Digit0), Some(0x27));
         assert_eq!(hid_usage(K::ControlLeft), Some(0xE3), "Ctrl acts as Command");
+        assert_eq!(hid_usage(K::Numpad0), Some(0x62));
+        assert_eq!(hid_usage(K::Numpad1), Some(0x59));
+        assert_eq!(hid_usage(K::Numpad9), Some(0x61));
+        assert_eq!(hid_usage(K::NumpadAdd), Some(0x57));
+        assert_eq!(hid_usage(K::NumpadSubtract), Some(0x56));
+        assert_eq!(hid_usage(K::NumpadMultiply), Some(0x55));
+        assert_eq!(hid_usage(K::NumpadDivide), Some(0x54));
+        assert_eq!(hid_usage(K::NumpadDecimal), Some(0x63));
+        assert_eq!(hid_usage(K::NumpadEnter), Some(0x58));
+        assert_eq!(hid_usage(K::NumpadEqual), Some(0x67));
         assert_eq!(hid_usage(K::F1), None, "F-keys are app shortcuts");
     }
 }
