@@ -1558,16 +1558,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // Windows clipboard paste path for either combination.
                 if code == KeyCode::KeyV && (ctrl || alt) {
                     if down && !event.repeat {
-                        let command_held =
-                            self.keys_down.contains(&0xE3) || self.keys_down.contains(&0xE7);
-                        if !command_held {
-                            self.send(HidEvent::Key { usage: 0xE3, down: true });
-                        }
+                        // Send a self-contained Command+V chord. Do not rely on
+                        // the physical Ctrl/Alt modifier having reached the phone:
+                        // modifier events can be reordered or missed around focus changes.
+                        self.send(HidEvent::Key { usage: 0xE3, down: true }); // Left GUI / Command
                         self.send(HidEvent::Key { usage: 0x19, down: true }); // V
                         self.send(HidEvent::Key { usage: 0x19, down: false });
-                        if !command_held {
-                            self.send(HidEvent::Key { usage: 0xE3, down: false });
-                        }
+                        self.send(HidEvent::Key { usage: 0xE3, down: false });
                     }
                     return;
                 }
