@@ -865,65 +865,71 @@ impl App {
     /// the paste, so the V must not also go to the phone.
     fn send_windows_clipboard(&mut self, paste: bool) -> bool {
         let seq = winclip::sequence();
-        if seq == self.clip_sent || self.link.is_none() {
-            return false;
-        }
-        if self.device.as_ref().is_none_or(|d| !d.wants_connection()) {
-            return false;
-        }
+        if (seq == self.clip_sent && !paste) || self.link.is_none() { return false; }
+        if self.device.as_ref().is_none_or(|d| !d.wants_connection()) { return false; }
         let content = winclip::read(self.hwnd);
-        // The same text or image again, with no iPhone copy in between: it
-        // is already there.
         let hash = match &content {
             Some(winclip::WinClip::Text(t)) => Some(hash_of(t.as_bytes())),
             Some(winclip::WinClip::Image(b)) => Some(hash_of(b)),
             _ => None,
         };
-        if hash.is_some() && hash == self.clip_sent_hash {
-            self.clip_sent = seq;
-            return false;
+        if paste {
+            if let Some(winclip::WinClip::Text(t)) = content.as_ref() {
+                self.type_clipboard_text(t);
+                (self.clip_sent, self.clip_sent_hash) = (seq, hash);
+                return true;
+            }
         }
+        if hash.is_some() && hash == self.clip_sent_hash { self.clip_sent = seq; return false; }
         let Some(d) = self.device.as_ref() else { return false };
         match content {
             Some(winclip::WinClip::Text(t)) => {
-                d.push_clipboard(PushContent::Text(t), paste);
-                (self.clip_sent, self.clip_sent_hash) = (seq, hash);
-                paste
+                d.push_clipboard(PushContent::Text(t), false);
+                (self.clip_sent, self.clip_sent_hash) = (seq, hash); false
             }
             Some(winclip::WinClip::Image(png)) => {
                 d.push_clipboard(PushContent::Png(png), paste);
-                (self.clip_sent, self.clip_sent_hash) = (seq, hash);
-                paste
+                (self.clip_sent, self.clip_sent_hash) = (seq, hash); paste
             }
             Some(winclip::WinClip::Files(files)) if paste => {
                 self.clip_sent_hash = None;
                 let what = if files.len() == 1 { "1 file".to_string() } else { format!("{} files", files.len()) };
                 tracing::info!("sending {what} copied in Explorer to the iPhone");
-                d.paste_files(files);
-                self.clip_sent = seq;
-                self.toast(format!("Sending {what} to iPhone…"), 120.0);
-                true
+                d.paste_files(files); self.clip_sent = seq;
+                self.toast(format!("Sending {what} to iPhone…"), 120.0); true
             }
             Some(winclip::WinClip::Files(_)) => false,
-            // Empty, private (password managers), or nothing the iPhone takes.
-            None => {
-                self.clip_sent = seq;
-                false
+            None => { self.clip_sent = seq; false }
+        }
+    }
+
+    /// Send clipboard text as HID keyboard events, avoiding the iOS pasteboard.
+    fn type_clipboard_text(&mut self, text: &str) {
+        let Some(d) = self.device.as_ref().filter(|d| d.wants_connection()) else { return };
+        let mut t = now_us();
+        for usage in [0xE3u16, 0xE7u16] {
+            if self.keys_down.contains(&usage) {
+                d.send(t, HidEvent::Key { usage, down: false });
+                t += 12_000;
             }
         }
+        let mut skipped = 0usize;
+        for ch in text.chars() {
+            let Some((usage, shifted)) = ascii_hid(ch) else { skipped += 1; continue };
+            if shifted { d.send(t, HidEvent::Key { usage: 0xE1, down: true }); t += 8_000; }
+            d.send(t, HidEvent::Key { usage, down: true }); t += 8_000;
+            d.send(t, HidEvent::Key { usage, down: false }); t += 8_000;
+            if shifted { d.send(t, HidEvent::Key { usage: 0xE1, down: false }); t += 8_000; }
+        }
+        if skipped > 0 { self.toast(format!("Typed supported text; skipped {skipped} non-ASCII character(s)"), 5.0); }
+        else { self.toast("Typed clipboard text without Paste permission", 2.5); }
     }
 
     /// Ctrl+V in Mirrorly: if the Windows clipboard is newer than the
     /// iPhone's and not there yet (a file copy, or a copy made a moment
     /// ago), send it and paste. True if the V was handled.
     fn paste_from_windows(&mut self) -> bool {
-        let windows_newer = match (self.win_copy_at, self.phone_copy_at) {
-            (Some(w), Some(p)) => w > p,
-            (Some(_), None) => true,
-            // Copied before Mirrorly started: unknown which is newer.
-            (None, _) => false,
-        };
-        windows_newer && self.send_windows_clipboard(true)
+        self.send_windows_clipboard(true)
     }
 
     fn clipboard(&mut self, ev: ClipEvent) {
@@ -1615,6 +1621,251 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// US ANSI keyboard mapping: (HID usage, Shift required).
+fn ascii_hid(ch: char) -> Option<(u16, bool)> {
+    if ch.is_ascii_lowercase() { return Some((0x04 + (ch as u8 - b'a') as u16, false)); }
+    if ch.is_ascii_uppercase() { return Some((0x04 + (ch as u8 - b'A') as u16, true)); }
+    if ch.is_ascii_digit() {
+        let n = ch as u8 - b'0';
+        return Some((if n == 0 { 0x27 } else { 0x1D + n as u16 }, false));
+    }
+    let pair = match ch {
+        ' ' => (0x2C, false), '\n' | '\r' => (0x28, false), '\t' => (0x2B, false),
+        '-' => (0x2D, false), '_' => (0x2D, true), '=' => (0x2E, false), '+' => (0x2E, true),
+        '[' => (0x2F, false), '{' => (0x2F, true), ']' => (0x30, false), '}' => (0x30, true),
+        '\\' => (0x31, false), '|' => (0x31, true), ';' => (0x33, false), ':' => (0x33, true),
+        '\'' => (0x34, false), '"' => (0x34, true), '`' => (0x35, false), '~' => (0x35, true),
+        ',' => (0x36, false), '<' => (0x36, true), '.' => (0x37, false), '>' => (0x37, true),
+        '/' => (0x38, false), '?' => (0x38, true), '!' => (0x1E, true), '@' => (0x1F, true),
+        '#' => (0x20, true), '
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// A file Mirrorly fetched from the iPhone's clipboard.
+fn is_from_iphone(path: &std::path::Path) -> bool {
+    // Windows paths compare case-insensitively.
+    let lower = |p: &std::path::Path| p.to_string_lossy().to_lowercase();
+    lower(path).starts_with(&lower(&device::clipboard::inbox()))
+}
+
+/// The bar chip for files fetched from the iPhone: the name for one file,
+/// else a count ("3 photos").
+fn shelf_for(files: &[std::path::PathBuf]) -> Shelf {
+    let ext = |f: &std::path::PathBuf| f.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_video = |f: &std::path::PathBuf| matches!(ext(f).as_str(), "mov" | "mp4");
+    let is_photo = |f: &std::path::PathBuf| matches!(ext(f).as_str(), "jpg" | "jpeg" | "png" | "heic" | "gif" | "webp" | "tiff");
+    let media = files.iter().all(|f| is_photo(f) || is_video(f));
+    let n = files.len();
+    let label = if n == 1 && !media {
+        files[0].file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "1 file".into())
+    } else if files.iter().all(is_photo) {
+        if n == 1 { "Photo".into() } else { format!("{n} photos") }
+    } else if files.iter().all(is_video) {
+        if n == 1 { "Video".into() } else { format!("{n} videos") }
+    } else if media {
+        format!("{n} items")
+    } else {
+        format!("{n} files")
+    };
+    Shelf { label, media }
+}
+
+/// Window class of the Mirrorly window, so a second launch can find it.
+const WINDOW_CLASS: &str = "MirrorlyWindow";
+
+/// One Mirrorly at a time: two would both hold the iPhone (disconnecting
+/// one left the other streaming, and the camera stayed busy). A second
+/// launch brings the running window forward instead.
+fn already_running() -> bool {
+    use windows::{
+        Win32::{
+            Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
+            System::Threading::CreateMutexW,
+            UI::WindowsAndMessaging::{FindWindowW, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow},
+        },
+        core::{HSTRING, w},
+    };
+    unsafe {
+        // Held (never closed) for the life of the process.
+        let Ok(_mutex) = CreateMutexW(None, false, w!(r"Local\Mirrorly.SingleInstance")) else { return false };
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        if let Ok(h) = FindWindowW(&HSTRING::from(WINDOW_CLASS), None) {
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(h);
+        }
+        true
+    }
+}
+
+/// The window's client area in screen pixels.
+fn client_screen_rect(hwnd: isize) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::{
+        Foundation::{HWND, POINT, RECT},
+        Graphics::Gdi::ClientToScreen,
+        UI::WindowsAndMessaging::GetClientRect,
+    };
+    unsafe {
+        let h = HWND(hwnd as _);
+        let mut r = RECT::default();
+        GetClientRect(h, &mut r).ok()?;
+        let mut p = POINT { x: 0, y: 0 };
+        ClientToScreen(h, &mut p).ok().ok()?;
+        Some(RECT { left: p.x, top: p.y, right: p.x + r.right, bottom: p.y + r.bottom })
+    }
+}
+
+/// Move the window with the mouse, from a press on the bar's background.
+fn drag_window(hwnd: isize) {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        UI::{
+            Input::KeyboardAndMouse::ReleaseCapture,
+            WindowsAndMessaging::{SC_MOVE, SendMessageW, WM_SYSCOMMAND},
+        },
+    };
+    // SC_MOVE | HTCAPTION: the system's move loop, as if the caption were
+    // dragged (the bar follows through WindowEvent::Moved).
+    unsafe {
+        let _ = ReleaseCapture();
+        SendMessageW(HWND(hwnd as _), WM_SYSCOMMAND, Some(WPARAM((SC_MOVE | 2) as usize)), Some(LPARAM(0)));
+    }
+}
+
+/// Top of the work area (excluding the taskbar) of the window's monitor.
+fn work_area_top(hwnd: isize) -> i32 {
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+    };
+    unsafe {
+        let mon = MonitorFromWindow(HWND(hwnd as _), MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() { mi.rcWork.top } else { 0 }
+    }
+}
+
+/// Writes frame records to a CSV on its own thread, so file I/O never sits
+/// in the present path.
+fn spawn_csv_logger(path: &std::path::Path) -> Result<mpsc::Sender<metrics::FrameRecord>> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?);
+    writeln!(out, "{}", metrics::FrameRecord::CSV_HEADER)?;
+    let (tx, rx) = mpsc::channel::<metrics::FrameRecord>();
+    std::thread::Builder::new().name("csv".into()).spawn(move || {
+        while let Ok(r) = rx.recv() {
+            if writeln!(out, "{}", r.csv()).is_err() {
+                return;
+            }
+        }
+        let _ = out.flush();
+    })?;
+    tracing::info!("writing per-frame timings to {}", path.display());
+    Ok(tx)
+}
+
+/// Log to `%LOCALAPPDATA%\Mirrorly\logs\<name>`, or to a console when
+/// asked (or in debug builds, which have one).
+fn init_logging(console: bool, name: &str) {
+    let filter = || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if console && !cfg!(debug_assertions) {
+        unsafe {
+            let _ = windows::Win32::System::Console::AllocConsole();
+        }
+    }
+    if console || cfg!(debug_assertions) {
+        tracing_subscriber::fmt().with_env_filter(filter()).init();
+        return;
+    }
+    let dir = device::paths::data_dir().join("logs");
+    let file = std::fs::create_dir_all(&dir).and_then(|_| std::fs::File::create(dir.join(name)));
+    match file {
+        Ok(f) => tracing_subscriber::fmt().with_env_filter(filter()).with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
+        Err(_) => tracing_subscriber::fmt().with_env_filter(filter()).init(),
+    }
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
+}
+
+fn main() -> Result<()> {
+    let _ = epoch();
+    unsafe { timeBeginPeriod(1) };
+    let args = Args::parse();
+    // The elevated copy that sets up the iPad display: only that, then exit.
+    if let Some(size) = &args.setup_display {
+        init_logging(args.console, "display-setup.log");
+        tracing::info!("Mirrorly {}: iPad display setup ({size})", env!("CARGO_PKG_VERSION"));
+        let code = match display::setup::perform(size) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!("iPad display setup failed: {e:#}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+    // Before logging: a second copy must not truncate the running one's log.
+    if already_running() {
+        return Ok(());
+    }
+    init_logging(args.console, "Mirrorly.log");
+    tracing::info!("Mirrorly {} starting", env!("CARGO_PKG_VERSION"));
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("event loop")?;
+    let mut app = App {
+        args,
+        proxy: event_loop.create_proxy(),
+        shared: Arc::new(Shared::default()),
+        slot: Arc::new(FrameSlot::default()),
+        window: None,
+        hwnd: 0,
+        device: None,
+        gesture: Gesture::default(),
+        cursor: (0.0, 0.0),
+        cursor_inside: false,
+        keys_down: HashSet::new(),
+        modifiers: Default::default(),
+        phone: None,
+        link: None,
+        size_level: DEFAULT_SIZE,
+        bar: None,
+        bar_cursor: None,
+        hide_bar_at: None,
+        scroll_busy_until: Instant::now(),
+        scroll_pending: 0.0,
+        shelf_files: Vec::new(),
+        dropped: Vec::new(),
+        toast_until: None,
+        clip_sent: 0,
+        clip_sent_hash: None,
+        win_copy_at: None,
+        phone_copy_at: None,
+        clip_writing: false,
+        display: None,
+        tray: None,
+        display_hidden: false,
+        display_setup: false,
+        opening: None,
+        recording: None,
+        gpu: None,
+        threads: Vec::new(),
+    };
+    event_loop.run_app(&mut app)?;
+    app.slot.quit();
+    Ok(())
+}
+ => (0x21, true), '%' => (0x22, true), '^' => (0x23, true),
+        '&' => (0x24, true), '*' => (0x25, true), '(' => (0x26, true), ')' => (0x27, true),
+        _ => return None,
+    };
+    Some(pair)
 }
 
 fn hash_of(bytes: &[u8]) -> u64 {
