@@ -1552,18 +1552,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let down = event.state == ElementState::Pressed;
                 let ctrl = self.modifiers.control_key();
 
-                // Make Ctrl+V an explicit Command+V chord on the phone.
-                // Ctrl is already mapped to the GUI/Command modifier for
-                // ordinary keys; reassert the modifier around V so this
-                // shortcut is delivered as one complete HID chord even if
-                // the host modifier state was not forwarded in time.
+                // Ctrl+V is intentionally disabled. Alt is mapped to
+                // Command in keys::hid_usage, matching iDesktop's Alt+V.
+                // Do not let Windows clipboard paste trigger on the phone.
                 if code == KeyCode::KeyV && ctrl {
-                    if down && !event.repeat {
-                        self.send(HidEvent::Key { usage: 0xE3, down: true }); // Left GUI / Command
-                        self.send(HidEvent::Key { usage: 0x19, down: true }); // V
-                        self.send(HidEvent::Key { usage: 0x19, down: false });
-                        self.send(HidEvent::Key { usage: 0xE3, down: false });
-                    }
                     return;
                 }
 
