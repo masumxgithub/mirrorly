@@ -74,8 +74,8 @@ pub fn hid_usage(code: K) -> Option<u16> {
         K::ControlRight => 0xE7, // -> Right GUI
         K::ShiftLeft => 0xE1,
         K::ShiftRight => 0xE5,
-        K::AltLeft => 0xE2,  // -> Option
-        K::AltRight => 0xE6,
+        K::AltLeft => 0xE3,  // -> Left GUI (Command), like iDesktop
+        K::AltRight => 0xE7, // -> Right GUI (Command)
         _ => return None,
     })
 }
