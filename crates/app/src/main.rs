@@ -1551,11 +1551,31 @@ impl ApplicationHandler<UserEvent> for App {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 let down = event.state == ElementState::Pressed;
                 let ctrl = self.modifiers.control_key();
+                let alt = self.modifiers.alt_key();
 
-                // Ctrl+V is intentionally disabled. Alt is mapped to
-                // Command in keys::hid_usage, matching iDesktop's Alt+V.
-                // Do not let Windows clipboard paste trigger on the phone.
+                // Ctrl+V is intentionally disabled: it must not invoke the
+                // Windows-clipboard paste path on the phone.
                 if code == KeyCode::KeyV && ctrl {
+                    return;
+                }
+
+                // Deliver Alt+V as an explicit Command+V chord. Normally Alt
+                // has already been forwarded as GUI/Command by keys::hid_usage.
+                // If the modifier event has not reached the phone yet, bracket
+                // V with a Command down/up so the chord is still complete.
+                if code == KeyCode::KeyV && alt {
+                    if down && !event.repeat {
+                        let command_held =
+                            self.keys_down.contains(&0xE3) || self.keys_down.contains(&0xE7);
+                        if !command_held {
+                            self.send(HidEvent::Key { usage: 0xE3, down: true });
+                        }
+                        self.send(HidEvent::Key { usage: 0x19, down: true }); // V
+                        self.send(HidEvent::Key { usage: 0x19, down: false });
+                        if !command_held {
+                            self.send(HidEvent::Key { usage: 0xE3, down: false });
+                        }
+                    }
                     return;
                 }
 
