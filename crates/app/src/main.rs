@@ -1553,21 +1553,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let ctrl = self.modifiers.control_key();
                 let alt = self.modifiers.alt_key();
 
-                // Both Windows Ctrl+V and Alt+V should arrive on iPhone as
-                // the native Command+V keyboard shortcut. Do not invoke the
-                // Windows clipboard paste path for either combination.
-                if code == KeyCode::KeyV && (ctrl || alt) {
-                    if down && !event.repeat {
-                        // Send a self-contained Command+V chord. Do not rely on
-                        // the physical Ctrl/Alt modifier having reached the phone:
-                        // modifier events can be reordered or missed around focus changes.
-                        self.send(HidEvent::Key { usage: 0xE3, down: true }); // Left GUI / Command
-                        self.send(HidEvent::Key { usage: 0x19, down: true }); // V
-                        self.send(HidEvent::Key { usage: 0x19, down: false });
-                        self.send(HidEvent::Key { usage: 0xE3, down: false });
-                    }
-                    return;
-                }
+                // Ctrl and Alt are mapped to HID Command in keys::hid_usage.
+                // Forward the physical modifier and V events in their natural
+                // order; do not synthesize a second Command+V chord here.
 
                 // Mac-style shortcuts (Ctrl stands in for Command), plus F-keys.
                 let shortcut: Option<&str> = match code {
