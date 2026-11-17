@@ -1640,6 +1640,463 @@ fn ascii_hid(ch: char) -> Option<(u16, bool)> {
         ',' => (0x36, false), '<' => (0x36, true), '.' => (0x37, false), '>' => (0x37, true),
         '/' => (0x38, false), '?' => (0x38, true), '!' => (0x1E, true), '@' => (0x1F, true),
         '#' => (0x20, true), '
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// A file Mirrorly fetched from the iPhone's clipboard.
+fn is_from_iphone(path: &std::path::Path) -> bool {
+    // Windows paths compare case-insensitively.
+    let lower = |p: &std::path::Path| p.to_string_lossy().to_lowercase();
+    lower(path).starts_with(&lower(&device::clipboard::inbox()))
+}
+
+/// The bar chip for files fetched from the iPhone: the name for one file,
+/// else a count ("3 photos").
+fn shelf_for(files: &[std::path::PathBuf]) -> Shelf {
+    let ext = |f: &std::path::PathBuf| f.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_video = |f: &std::path::PathBuf| matches!(ext(f).as_str(), "mov" | "mp4");
+    let is_photo = |f: &std::path::PathBuf| matches!(ext(f).as_str(), "jpg" | "jpeg" | "png" | "heic" | "gif" | "webp" | "tiff");
+    let media = files.iter().all(|f| is_photo(f) || is_video(f));
+    let n = files.len();
+    let label = if n == 1 && !media {
+        files[0].file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "1 file".into())
+    } else if files.iter().all(is_photo) {
+        if n == 1 { "Photo".into() } else { format!("{n} photos") }
+    } else if files.iter().all(is_video) {
+        if n == 1 { "Video".into() } else { format!("{n} videos") }
+    } else if media {
+        format!("{n} items")
+    } else {
+        format!("{n} files")
+    };
+    Shelf { label, media }
+}
+
+/// Window class of the Mirrorly window, so a second launch can find it.
+const WINDOW_CLASS: &str = "MirrorlyWindow";
+
+/// One Mirrorly at a time: two would both hold the iPhone (disconnecting
+/// one left the other streaming, and the camera stayed busy). A second
+/// launch brings the running window forward instead.
+fn already_running() -> bool {
+    use windows::{
+        Win32::{
+            Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
+            System::Threading::CreateMutexW,
+            UI::WindowsAndMessaging::{FindWindowW, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow},
+        },
+        core::{HSTRING, w},
+    };
+    unsafe {
+        // Held (never closed) for the life of the process.
+        let Ok(_mutex) = CreateMutexW(None, false, w!(r"Local\Mirrorly.SingleInstance")) else { return false };
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        if let Ok(h) = FindWindowW(&HSTRING::from(WINDOW_CLASS), None) {
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(h);
+        }
+        true
+    }
+}
+
+/// The window's client area in screen pixels.
+fn client_screen_rect(hwnd: isize) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::{
+        Foundation::{HWND, POINT, RECT},
+        Graphics::Gdi::ClientToScreen,
+        UI::WindowsAndMessaging::GetClientRect,
+    };
+    unsafe {
+        let h = HWND(hwnd as _);
+        let mut r = RECT::default();
+        GetClientRect(h, &mut r).ok()?;
+        let mut p = POINT { x: 0, y: 0 };
+        ClientToScreen(h, &mut p).ok().ok()?;
+        Some(RECT { left: p.x, top: p.y, right: p.x + r.right, bottom: p.y + r.bottom })
+    }
+}
+
+/// Move the window with the mouse, from a press on the bar's background.
+fn drag_window(hwnd: isize) {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        UI::{
+            Input::KeyboardAndMouse::ReleaseCapture,
+            WindowsAndMessaging::{SC_MOVE, SendMessageW, WM_SYSCOMMAND},
+        },
+    };
+    // SC_MOVE | HTCAPTION: the system's move loop, as if the caption were
+    // dragged (the bar follows through WindowEvent::Moved).
+    unsafe {
+        let _ = ReleaseCapture();
+        SendMessageW(HWND(hwnd as _), WM_SYSCOMMAND, Some(WPARAM((SC_MOVE | 2) as usize)), Some(LPARAM(0)));
+    }
+}
+
+/// Top of the work area (excluding the taskbar) of the window's monitor.
+fn work_area_top(hwnd: isize) -> i32 {
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+    };
+    unsafe {
+        let mon = MonitorFromWindow(HWND(hwnd as _), MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() { mi.rcWork.top } else { 0 }
+    }
+}
+
+/// Writes frame records to a CSV on its own thread, so file I/O never sits
+/// in the present path.
+fn spawn_csv_logger(path: &std::path::Path) -> Result<mpsc::Sender<metrics::FrameRecord>> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?);
+    writeln!(out, "{}", metrics::FrameRecord::CSV_HEADER)?;
+    let (tx, rx) = mpsc::channel::<metrics::FrameRecord>();
+    std::thread::Builder::new().name("csv".into()).spawn(move || {
+        while let Ok(r) = rx.recv() {
+            if writeln!(out, "{}", r.csv()).is_err() {
+                return;
+            }
+        }
+        let _ = out.flush();
+    })?;
+    tracing::info!("writing per-frame timings to {}", path.display());
+    Ok(tx)
+}
+
+/// Log to `%LOCALAPPDATA%\Mirrorly\logs\<name>`, or to a console when
+/// asked (or in debug builds, which have one).
+fn init_logging(console: bool, name: &str) {
+    let filter = || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if console && !cfg!(debug_assertions) {
+        unsafe {
+            let _ = windows::Win32::System::Console::AllocConsole();
+        }
+    }
+    if console || cfg!(debug_assertions) {
+        tracing_subscriber::fmt().with_env_filter(filter()).init();
+        return;
+    }
+    let dir = device::paths::data_dir().join("logs");
+    let file = std::fs::create_dir_all(&dir).and_then(|_| std::fs::File::create(dir.join(name)));
+    match file {
+        Ok(f) => tracing_subscriber::fmt().with_env_filter(filter()).with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
+        Err(_) => tracing_subscriber::fmt().with_env_filter(filter()).init(),
+    }
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
+}
+
+fn main() -> Result<()> {
+    let _ = epoch();
+    unsafe { timeBeginPeriod(1) };
+    let args = Args::parse();
+    // The elevated copy that sets up the iPad display: only that, then exit.
+    if let Some(size) = &args.setup_display {
+        init_logging(args.console, "display-setup.log");
+        tracing::info!("Mirrorly {}: iPad display setup ({size})", env!("CARGO_PKG_VERSION"));
+        let code = match display::setup::perform(size) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!("iPad display setup failed: {e:#}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+    // Before logging: a second copy must not truncate the running one's log.
+    if already_running() {
+        return Ok(());
+    }
+    init_logging(args.console, "Mirrorly.log");
+    tracing::info!("Mirrorly {} starting", env!("CARGO_PKG_VERSION"));
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("event loop")?;
+    let mut app = App {
+        args,
+        proxy: event_loop.create_proxy(),
+        shared: Arc::new(Shared::default()),
+        slot: Arc::new(FrameSlot::default()),
+        window: None,
+        hwnd: 0,
+        device: None,
+        gesture: Gesture::default(),
+        cursor: (0.0, 0.0),
+        cursor_inside: false,
+        keys_down: HashSet::new(),
+        modifiers: Default::default(),
+        phone: None,
+        link: None,
+        size_level: DEFAULT_SIZE,
+        bar: None,
+        bar_cursor: None,
+        hide_bar_at: None,
+        scroll_busy_until: Instant::now(),
+        scroll_pending: 0.0,
+        shelf_files: Vec::new(),
+        dropped: Vec::new(),
+        toast_until: None,
+        clip_sent: 0,
+        clip_sent_hash: None,
+        win_copy_at: None,
+        phone_copy_at: None,
+        clip_writing: false,
+        display: None,
+        tray: None,
+        display_hidden: false,
+        display_setup: false,
+        opening: None,
+        recording: None,
+        gpu: None,
+        threads: Vec::new(),
+    };
+    event_loop.run_app(&mut app)?;
+    app.slot.quit();
+    Ok(())
+}
+ => (0x21, true), '%' => (0x22, true), '^' => (0x23, true),
+        '&' => (0x24, true), '*' => (0x25, true), '(' => (0x26, true), ')' => (0x27, true),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+fn hash_of(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// A file Mirrorly fetched from the iPhone's clipboard.
+fn is_from_iphone(path: &std::path::Path) -> bool {
+    // Windows paths compare case-insensitively.
+    let lower = |p: &std::path::Path| p.to_string_lossy().to_lowercase();
+    lower(path).starts_with(&lower(&device::clipboard::inbox()))
+}
+
+/// The bar chip for files fetched from the iPhone: the name for one file,
+/// else a count ("3 photos").
+fn shelf_for(files: &[std::path::PathBuf]) -> Shelf {
+    let ext = |f: &std::path::PathBuf| f.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_video = |f: &std::path::PathBuf| matches!(ext(f).as_str(), "mov" | "mp4");
+    let is_photo = |f: &std::path::PathBuf| matches!(ext(f).as_str(), "jpg" | "jpeg" | "png" | "heic" | "gif" | "webp" | "tiff");
+    let media = files.iter().all(|f| is_photo(f) || is_video(f));
+    let n = files.len();
+    let label = if n == 1 && !media {
+        files[0].file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "1 file".into())
+    } else if files.iter().all(is_photo) {
+        if n == 1 { "Photo".into() } else { format!("{n} photos") }
+    } else if files.iter().all(is_video) {
+        if n == 1 { "Video".into() } else { format!("{n} videos") }
+    } else if media {
+        format!("{n} items")
+    } else {
+        format!("{n} files")
+    };
+    Shelf { label, media }
+}
+
+/// Window class of the Mirrorly window, so a second launch can find it.
+const WINDOW_CLASS: &str = "MirrorlyWindow";
+
+/// One Mirrorly at a time: two would both hold the iPhone (disconnecting
+/// one left the other streaming, and the camera stayed busy). A second
+/// launch brings the running window forward instead.
+fn already_running() -> bool {
+    use windows::{
+        Win32::{
+            Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
+            System::Threading::CreateMutexW,
+            UI::WindowsAndMessaging::{FindWindowW, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow},
+        },
+        core::{HSTRING, w},
+    };
+    unsafe {
+        // Held (never closed) for the life of the process.
+        let Ok(_mutex) = CreateMutexW(None, false, w!(r"Local\Mirrorly.SingleInstance")) else { return false };
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        if let Ok(h) = FindWindowW(&HSTRING::from(WINDOW_CLASS), None) {
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(h);
+        }
+        true
+    }
+}
+
+/// The window's client area in screen pixels.
+fn client_screen_rect(hwnd: isize) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::{
+        Foundation::{HWND, POINT, RECT},
+        Graphics::Gdi::ClientToScreen,
+        UI::WindowsAndMessaging::GetClientRect,
+    };
+    unsafe {
+        let h = HWND(hwnd as _);
+        let mut r = RECT::default();
+        GetClientRect(h, &mut r).ok()?;
+        let mut p = POINT { x: 0, y: 0 };
+        ClientToScreen(h, &mut p).ok().ok()?;
+        Some(RECT { left: p.x, top: p.y, right: p.x + r.right, bottom: p.y + r.bottom })
+    }
+}
+
+/// Move the window with the mouse, from a press on the bar's background.
+fn drag_window(hwnd: isize) {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        UI::{
+            Input::KeyboardAndMouse::ReleaseCapture,
+            WindowsAndMessaging::{SC_MOVE, SendMessageW, WM_SYSCOMMAND},
+        },
+    };
+    // SC_MOVE | HTCAPTION: the system's move loop, as if the caption were
+    // dragged (the bar follows through WindowEvent::Moved).
+    unsafe {
+        let _ = ReleaseCapture();
+        SendMessageW(HWND(hwnd as _), WM_SYSCOMMAND, Some(WPARAM((SC_MOVE | 2) as usize)), Some(LPARAM(0)));
+    }
+}
+
+/// Top of the work area (excluding the taskbar) of the window's monitor.
+fn work_area_top(hwnd: isize) -> i32 {
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+    };
+    unsafe {
+        let mon = MonitorFromWindow(HWND(hwnd as _), MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() { mi.rcWork.top } else { 0 }
+    }
+}
+
+/// Writes frame records to a CSV on its own thread, so file I/O never sits
+/// in the present path.
+fn spawn_csv_logger(path: &std::path::Path) -> Result<mpsc::Sender<metrics::FrameRecord>> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?);
+    writeln!(out, "{}", metrics::FrameRecord::CSV_HEADER)?;
+    let (tx, rx) = mpsc::channel::<metrics::FrameRecord>();
+    std::thread::Builder::new().name("csv".into()).spawn(move || {
+        while let Ok(r) = rx.recv() {
+            if writeln!(out, "{}", r.csv()).is_err() {
+                return;
+            }
+        }
+        let _ = out.flush();
+    })?;
+    tracing::info!("writing per-frame timings to {}", path.display());
+    Ok(tx)
+}
+
+/// Log to `%LOCALAPPDATA%\Mirrorly\logs\<name>`, or to a console when
+/// asked (or in debug builds, which have one).
+fn init_logging(console: bool, name: &str) {
+    let filter = || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if console && !cfg!(debug_assertions) {
+        unsafe {
+            let _ = windows::Win32::System::Console::AllocConsole();
+        }
+    }
+    if console || cfg!(debug_assertions) {
+        tracing_subscriber::fmt().with_env_filter(filter()).init();
+        return;
+    }
+    let dir = device::paths::data_dir().join("logs");
+    let file = std::fs::create_dir_all(&dir).and_then(|_| std::fs::File::create(dir.join(name)));
+    match file {
+        Ok(f) => tracing_subscriber::fmt().with_env_filter(filter()).with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
+        Err(_) => tracing_subscriber::fmt().with_env_filter(filter()).init(),
+    }
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
+}
+
+fn main() -> Result<()> {
+    let _ = epoch();
+    unsafe { timeBeginPeriod(1) };
+    let args = Args::parse();
+    // The elevated copy that sets up the iPad display: only that, then exit.
+    if let Some(size) = &args.setup_display {
+        init_logging(args.console, "display-setup.log");
+        tracing::info!("Mirrorly {}: iPad display setup ({size})", env!("CARGO_PKG_VERSION"));
+        let code = match display::setup::perform(size) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!("iPad display setup failed: {e:#}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+    // Before logging: a second copy must not truncate the running one's log.
+    if already_running() {
+        return Ok(());
+    }
+    init_logging(args.console, "Mirrorly.log");
+    tracing::info!("Mirrorly {} starting", env!("CARGO_PKG_VERSION"));
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().context("event loop")?;
+    let mut app = App {
+        args,
+        proxy: event_loop.create_proxy(),
+        shared: Arc::new(Shared::default()),
+        slot: Arc::new(FrameSlot::default()),
+        window: None,
+        hwnd: 0,
+        device: None,
+        gesture: Gesture::default(),
+        cursor: (0.0, 0.0),
+        cursor_inside: false,
+        keys_down: HashSet::new(),
+        modifiers: Default::default(),
+        phone: None,
+        link: None,
+        size_level: DEFAULT_SIZE,
+        bar: None,
+        bar_cursor: None,
+        hide_bar_at: None,
+        scroll_busy_until: Instant::now(),
+        scroll_pending: 0.0,
+        shelf_files: Vec::new(),
+        dropped: Vec::new(),
+        toast_until: None,
+        clip_sent: 0,
+        clip_sent_hash: None,
+        win_copy_at: None,
+        phone_copy_at: None,
+        clip_writing: false,
+        display: None,
+        tray: None,
+        display_hidden: false,
+        display_setup: false,
+        opening: None,
+        recording: None,
+        gpu: None,
+        threads: Vec::new(),
+    };
+    event_loop.run_app(&mut app)?;
+    app.slot.quit();
+    Ok(())
+}
+ => (0x21, true), '%' => (0x22, true), '^' => (0x23, true),
+        '&' => (0x24, true), '*' => (0x25, true), '(' => (0x26, true), ')' => (0x27, true),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+fn hash_of(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
