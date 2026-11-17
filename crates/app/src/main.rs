@@ -1553,17 +1553,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let ctrl = self.modifiers.control_key();
                 let alt = self.modifiers.alt_key();
 
-                // Ctrl+V is intentionally disabled: it must not invoke the
-                // Windows-clipboard paste path on the phone.
-                if code == KeyCode::KeyV && ctrl {
-                    return;
-                }
-
-                // Deliver Alt+V as an explicit Command+V chord. Normally Alt
-                // has already been forwarded as GUI/Command by keys::hid_usage.
-                // If the modifier event has not reached the phone yet, bracket
-                // V with a Command down/up so the chord is still complete.
-                if code == KeyCode::KeyV && alt {
+                // Both Windows Ctrl+V and Alt+V should arrive on iPhone as
+                // the native Command+V keyboard shortcut. Do not invoke the
+                // Windows clipboard paste path for either combination.
+                if code == KeyCode::KeyV && (ctrl || alt) {
                     if down && !event.repeat {
                         let command_held =
                             self.keys_down.contains(&0xE3) || self.keys_down.contains(&0xE7);
