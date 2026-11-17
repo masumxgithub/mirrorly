@@ -1305,8 +1305,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.clip_writing || winclip::sequence() == self.clip_sent {
                     return;
                 }
-                self.win_copy_at = Some(Instant::now());
-                self.send_windows_clipboard(false);
+                // Windows-to-iPhone clipboard sync is disabled. Ctrl+V is
+                // forwarded as the native Command+V HID shortcut instead.
                 return;
             }
             UserEvent::ClipWritten(seq) => {
@@ -1400,10 +1400,6 @@ impl ApplicationHandler<UserEvent> for App {
                 self.link = Some(link);
                 self.phone = Some(info.name.clone());
                 self.set_title();
-                // Copied on Windows while the iPhone was away: hand it over.
-                if self.win_copy_at > self.phone_copy_at {
-                    self.send_windows_clipboard(false);
-                }
             }
             DeviceEvent::Disconnected(_) => {
                 // The stream ended: finish the recording with what it has.
@@ -1606,10 +1602,6 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // iOS repeats held keys itself, like with a hardware keyboard.
                 if event.repeat {
-                    return;
-                }
-                // Ctrl+V: paste what was copied on Windows, if that is newer.
-                if code == KeyCode::KeyV && down && self.modifiers.control_key() && self.paste_from_windows() {
                     return;
                 }
                 if let Some(usage) = hid_usage(code) {
