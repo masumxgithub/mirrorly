@@ -875,7 +875,10 @@ impl App {
         };
         if paste {
             if let Some(winclip::WinClip::Text(t)) = content.as_ref() {
-                self.type_clipboard_text(t);
+                let Some(d) = self.device.as_ref() else { return false };
+                // Match iDesktop: sync the real clipboard, then let the device
+                // perform its native Command+V paste (rather than HID-typing text).
+                d.push_clipboard(PushContent::Text(t.clone()), true);
                 (self.clip_sent, self.clip_sent_hash) = (seq, hash);
                 return true;
             }
