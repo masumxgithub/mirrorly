@@ -1639,7 +1639,15 @@ fn ascii_hid(ch: char) -> Option<(u16, bool)> {
         '\'' => (0x34, false), '"' => (0x34, true), '`' => (0x35, false), '~' => (0x35, true),
         ',' => (0x36, false), '<' => (0x36, true), '.' => (0x37, false), '>' => (0x37, true),
         '/' => (0x38, false), '?' => (0x38, true), '!' => (0x1E, true), '@' => (0x1F, true),
-        '#' => (0x20, true), '
+        '#' => (0x20, true), '$' => (0x21, true), '%' => (0x22, true), '^' => (0x23, true),
+        '&' => (0x24, true), '*' => (0x25, true), '(' => (0x26, true), ')' => (0x27, true),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+fn hash_of(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     h.finish()
