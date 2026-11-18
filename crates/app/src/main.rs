@@ -1552,6 +1552,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let down = event.state == ElementState::Pressed;
                 let ctrl = self.modifiers.control_key();
                 let alt = self.modifiers.alt_key();
+                tracing::info!("KEY event code={:?} state={:?} repeat={} ctrl={} alt={}", code, event.state, event.repeat, ctrl, alt);
 
                 // Ctrl and Alt are mapped to HID Command in keys::hid_usage.
                 // Forward the physical modifier and V events in their natural
@@ -1611,6 +1612,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if let Some(usage) = hid_usage(code) {
+                    tracing::info!("HID key usage=0x{:02X} down={} for {:?}", usage, down, code);
                     if down {
                         self.keys_down.insert(usage);
                     } else if !self.keys_down.remove(&usage) {
